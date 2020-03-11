@@ -329,7 +329,7 @@ class SimpleGADriver(Driver):
         If one of the objectives :math:`f_k` is not a scalar, its elements will have the same
         weights, and it will be normed with length of the vector.
 
-        Takes into account constraints with a penalty function.
+        Takes into account constraints # TODO
 
         All constraints are converted to the form of :math:`g_i(x) \leq 0` for
         inequality constraints and :math:`h_i(x) = 0` for equality constraints.
@@ -372,6 +372,8 @@ class SimpleGADriver(Driver):
         -------
         float
             Objective value
+        ndarray
+            Constraint values
         bool
             Success flag, True if successful
         int
@@ -414,7 +416,7 @@ class SimpleGADriver(Driver):
 
             obj_values = self.get_objective_values()
             if is_single_objective:  # Single objective optimization
-                obj = next(itervalues(obj_values))  # First and only key in the dict
+                fun = next(itervalues(obj_values))  # First and only key in the dict
             else:  # Multi-objective optimization with weighted sums
                 weighted_objectives = np.array([])
                 for name, val in iteritems(obj_values):
@@ -428,30 +430,52 @@ class SimpleGADriver(Driver):
                         raise KeyError(msg.format(name))
                     weighted_objectives = np.hstack((weighted_objectives, weighted_obj))
 
-                obj = sum(weighted_objectives / sum_weights)**obj_exponent
+                fun = sum(weighted_objectives / sum_weights)**obj_exponent
 
-            # Parameters of the penalty method
-            penalty = self.options['penalty_parameter']
-            exponent = self.options['penalty_exponent']
-
-            if penalty == 0:
-                fun = obj
-            else:
-                constraint_violations = np.array([])
+            # Get the constraint violations
+            g = np.array([])
+            with np.errstate(
+                    divide="ignore"
+            ):  # Ignore divide-by-zero warnings temporarily
                 for name, val in iteritems(self.get_constraint_values()):
                     con = self._cons[name]
                     # The not used fields will either None or a very large number
-                    if (con['lower'] is not None) and np.any(con['lower'] > -almost_inf):
-                        diff = val - con['lower']
-                        violation = np.array([0. if d >= 0 else abs(d) for d in diff])
-                    elif (con['upper'] is not None) and np.any(con['upper'] < almost_inf):
-                        diff = val - con['upper']
-                        violation = np.array([0. if d <= 0 else abs(d) for d in diff])
-                    elif (con['equals'] is not None) and np.any(np.abs(con['equals']) < almost_inf):
-                        diff = val - con['equals']
-                        violation = np.absolute(diff)
-                    constraint_violations = np.hstack((constraint_violations, violation))
-                fun = obj + penalty * sum(np.power(constraint_violations, exponent))
+                    # All constraints will be converted into standard <= 0 form.
+                    if (con["lower"] is not None) and np.any(
+                            con["lower"] > -almost_inf
+                    ):
+                        g = np.append(
+                            g,
+                            np.where(
+                                con["lower"] == 0,
+                                con["lower"] - val,
+                                1 - val / con["lower"],
+                            ).flatten(),
+                        )
+                    elif (con["upper"] is not None) and np.any(
+                            con["upper"] < almost_inf
+                    ):
+                        g = np.append(
+                            g,
+                            np.where(
+                                con["upper"] == 0,
+                                val - con["upper"],
+                                val / con["upper"] - 1,
+                            ).flatten(),
+                        )
+                    elif (con["equals"] is not None) and np.any(
+                            np.abs(con["equals"]) < almost_inf
+                    ):
+                        g = np.append(
+                            g,
+                            np.where(
+                                con["equals"] == 0,
+                                np.abs(con["equals"] - val),
+                                np.abs(1 - val / con["equals"]),
+                            ).flatten()
+                            - 1e-6,
+                        )
+
             # Record after getting obj to assure they have
             # been gathered in MPI.
             rec.abs = 0.0
@@ -460,7 +484,7 @@ class SimpleGADriver(Driver):
         # print("Functions calculated")
         # print(x)
         # print(obj)
-        return fun, success, icase
+        return fun, g.flatten(), success, icase
 
 
 class GeneticAlgorithm(object):
@@ -574,6 +598,8 @@ class GeneticAlgorithm(object):
             old_gen = copy.deepcopy(new_gen)
             x_pop = self.decode(old_gen, vlb, vub, bits)
 
+            constraints = self.npop * [None]
+
             # Evaluate points in this generation.
             if comm is not None:
                 # Parallel
@@ -600,9 +626,10 @@ class GeneticAlgorithm(object):
                     returns, traceback = result
 
                     if returns:
-                        val, success, ii = returns
+                        val, con, success, ii = returns
                         if success:
                             fitness[ii] = val
+                            constraints[ii] = con
                             nfit += 1
 
                     else:
@@ -619,12 +646,17 @@ class GeneticAlgorithm(object):
                         # Exceeded bounds for integer variables that are over-allocated.
                         success = False
                     else:
-                        fitness[ii], success, _ = self.objfun(x, 0)
+                        fitness[ii], constraints[ii], success, _ = self.objfun(x, 0)
 
                     if success:
                         nfit += 1
                     else:
                         fitness[ii] = np.inf
+
+            n_con = constraints[next(i for i in range(self.npop) if constraints[i] is not None)].size
+            constraints = np.stack(tuple(np.zeros(n_con) if c is None else c for c in constraints))
+            if constraints.size == 0:
+                constraints = np.zeros((self.npop, ))
 
             # Elitism means replace worst performing point with best from previous generation.
             if elite and generation > 0:
@@ -644,13 +676,13 @@ class GeneticAlgorithm(object):
                 xopt = min_x
 
             # Evolve new generation.
-            new_gen = self.tournament(old_gen, fitness)
+            new_gen = self.tournament(old_gen, fitness, constraints)
             new_gen = self.crossover(new_gen, Pc)
             new_gen = self.mutate(new_gen, Pm)
 
         return xopt, fopt, nfit
 
-    def tournament(self, old_gen, fitness):
+    def tournament(self, old_gen, fitness, constraints):
         """
         Apply tournament selection and keep the best points.
 
@@ -662,20 +694,48 @@ class GeneticAlgorithm(object):
         fitness : ndarray
             Objective value of each point.
 
+        constraints : ndarray
+            Constraint values of each point.
+
         Returns
         -------
         ndarray
             New generation with best points.
         """
+        con_tol = 1e-6
         new_gen = []
         idx = np.array(range(0, self.npop - 1, 2))
         for j in range(2):
             old_gen, i_shuffled = self.shuffle(old_gen)
             fitness = fitness[i_shuffled]
 
-            # Each point competes with its neighbor; save the best.
-            i_min = np.argmin(np.array([[fitness[idx]], [fitness[idx + 1]]]), axis=0)
-            selected = i_min + idx
+            if constraints.size == 0:
+                i_min = np.argmin(np.array([[fitness[idx]], [fitness[idx + 1]]]), axis=0)
+                selected = i_min + idx
+            else:
+                selected = []
+                # Each point competes with its neighbor; save the best.
+                for i in idx:
+                    f1 = np.all(constraints[i] <= con_tol)
+                    f2 = np.all(constraints[i + 1] <= con_tol)
+                    if f1 and f2:
+                        if fitness[i] <= fitness[i + 1]:
+                            selected += [i]
+                        else:
+                            selected += [i + 1]
+                    elif f1 and not f2:
+                        selected += [i]
+                    elif not f1 and f2:
+                        selected += [i + 1]
+                    elif not f1 and not f2:
+                        if (
+                                np.sum(np.where(constraints[i] > con_tol, constraints[i], 0.0)) <=
+                                np.sum(np.where(constraints[i + 1] > con_tol, constraints[i + 1], 0.0))
+                        ):
+                            selected += [i]
+                        else:
+                            selected += [i + 1]
+
             new_gen.append(old_gen[selected])
 
         return np.concatenate(np.array(new_gen), axis=1).reshape(old_gen.shape)
